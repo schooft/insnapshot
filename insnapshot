@@ -203,10 +203,10 @@ if [[ ! -r $SOURCE ]]; then
 fi
 
 # normalize paths
-SOURCE=$(realpath "$SOURCE")
+SOURCE=$(realpath -m "$SOURCE")
 SOURCE="${SOURCE%/}/"  # trailing slash means only the content of $SOURCE dir is backed up
 [[ -z "$DESTDIR" ]] && DESTDIR="${SOURCE}old-versions"
-DESTDIR=$(realpath "$DESTDIR")
+DESTDIR=$(realpath -m "$DESTDIR")
 
 echo "SOURCE=$SOURCE"
 echo "DESTDIR=$DESTDIR"
