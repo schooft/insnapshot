@@ -205,7 +205,7 @@ fi
 # normalize paths
 SOURCE=$(realpath "$SOURCE")
 SOURCE="${SOURCE%/}/"  # trailing slash means only the content of $SOURCE dir is backed up
-[[ -z "$DESTDIR" ]] && DESTDIR="$SOURCE/old-versions"
+[[ -z "$DESTDIR" ]] && DESTDIR="${SOURCE}old-versions"
 DESTDIR=$(realpath "$DESTDIR")
 
 echo "SOURCE=$SOURCE"
