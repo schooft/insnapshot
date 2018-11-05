@@ -1,0 +1,415 @@
+#!/bin/bash
+
+CMD=./insnapshot
+
+exit_code=0
+
+OWN_PID=$$
+
+OUTBUFFER=$(mktemp)
+
+error () {
+    echo
+    echo -e "\e[01;31m$@\e[0m" >&2
+    exit_code=1
+    cleanexit
+}
+
+testsuccess () {
+    [[ $# -gt 1 ]] || error "testsuccess must be called with a name and a command"
+    testname=$1
+    shift
+    echo
+    echo "executing $testname"
+    echo "test command: $@"
+    "$@" || error "X $testname failed"
+}
+
+testfailure () {
+    [[ $# -gt 1 ]] || error "testfailure must be called with a name and a command"
+    testname=$1
+    shift
+    echo
+    echo "executing $testname"
+    echo "test command: $@"
+    "$@" && error "X $testname should have failed"
+}
+
+testwarning () {
+    [[ $# -gt 1 ]] || error "testwarning must be called with a name and a command"
+    testname=$1
+    shift
+    echo
+    echo "executing $testname"
+    echo "test command: $@"
+    err=$("$@" 2>&1 >$OUTBUFFER) || error "X $testname failed with $err"
+    cat $OUTBUFFER
+    [[ $err == WARNING* ]] || error "X $testname should have printed a warning"
+}
+
+
+comparetrees () {
+    if [[ ! $1 =~ ^$2$ ]]; then
+        echo "first tree:"
+        echo "$1"
+        echo "---------"
+        echo "second tree:"
+        echo "$2"
+        echo "---------"
+        error "the file trees don't match"
+    fi
+}
+
+
+setuptestenv () {
+    cleanup
+    echo
+    excludefile=$(mktemp)    
+    tmpdir=$(mktemp -d)
+    echo "setting up testing directory in $tmpdir"
+    mkdir $tmpdir/dir
+    touch $tmpdir/dir/file
+    touch $tmpdir/file    
+}
+
+cleanup() {
+    [[ -f $OUTBUFFER ]] && rm $OUTBUFFER
+    [[ -f $excludefile ]] && rm $excludefile
+    [[ -d $tmpdir ]] && rm -r $tmpdir    
+    echo "done cleaning up"
+}
+
+cleanexit () {
+    kill $INS_PID
+    wait $INS_PID
+    cleanup
+    exit $exit_code
+}
+
+trap cleanexit INT TERM
+
+
+#####################################
+###
+###  tests
+###
+#####################################
+
+##
+## test missing source
+##
+
+setuptestenv
+testfailure "test missing source" \
+    "$CMD" --exclude-from "$excludefile" --oneshot "$tmpdir"foo
+
+
+##
+## test non-empty destination
+##
+
+setuptestenv
+testwarning "test non-empty destination" \
+    "$CMD" --exclude-from "$excludefile" --oneshot "$tmpdir" $tmpdir/dir
+
+
+##
+## test create excludefile
+##
+
+setuptestenv
+rm $excludefile
+testsuccess "test create excludefile" \
+    "$CMD" --exclude-from "$excludefile" --oneshot "$tmpdir"
+grep -q -e '^- .gvfs/$' "$excludefile" || error "X missing excludefile should have been created"
+
+
+##
+## test add .gvfs to excludefile
+##
+
+setuptestenv
+testsuccess "test add .gvfs to excludefile" \
+    "$CMD" --exclude-from "$excludefile" --oneshot "$tmpdir"
+grep -q -e '^- .gvfs/$' "$excludefile" || error "X missing excludefile should have been created"
+
+
+##
+## test DESTDIR in SOURCE
+##
+
+setuptestenv
+testsuccess "test DESTDIR in SOURCE" \
+    "$CMD" --exclude-from "$excludefile" --oneshot "$tmpdir"/
+
+filetree=$(tree $tmpdir)
+testdate=$(date "+%Y-%m-%d")
+
+testtree="\
+$tmpdir
+├── dir
+│   └── file
+├── file
+└── old-versions
+    ├── ${testdate}_T[0-9_]*
+    │   ├── dir
+    │   │   └── file
+    │   └── file
+    └── latest -> ${testdate}_T[0-9_]*
+
+5 directories, 4 files"
+
+comparetrees "$filetree" "$testtree"
+
+sleep 1
+testsuccess "test DESTDIR in SOURCE second run" \
+    "$CMD" --exclude-from "$excludefile" --oneshot "$tmpdir"/
+
+filetree=$(tree $tmpdir)
+testdate=$(date "+%Y-%m-%d")
+
+testtree="\
+$tmpdir
+├── dir
+│   └── file
+├── file
+└── old-versions
+    ├── ${testdate}_T[0-9_]*
+    │   ├── dir
+    │   │   └── file
+    │   └── file
+    ├── ${testdate}_T[0-9_]*
+    │   ├── dir
+    │   │   └── file
+    │   └── file
+    └── latest -> ${testdate}_T[0-9_]*
+
+7 directories, 6 files"
+
+comparetrees "$filetree" "$testtree"
+
+
+##
+## test DESTDIR outside SOURCE
+##
+
+setuptestenv
+tmpdest=$(mktemp -d)
+testsuccess "test DESTDIR outside SOURCE" \
+    "$CMD" --exclude-from "$excludefile" --oneshot "$tmpdir" "$tmpdest"
+
+filetree=$(tree $tmpdir)
+desttree=$(tree $tmpdest)
+testdate=$(date "+%Y-%m-%d")
+
+testtree="\
+$tmpdir
+├── dir
+│   └── file
+└── file
+
+1 directory, 2 files"
+
+comparetrees "$filetree" "$testtree"
+
+testtree="\
+$tmpdest
+├── ${testdate}_T[0-9_]*
+│   ├── dir
+│   │   └── file
+│   └── file
+└── latest -> ${testdate}_T[0-9_]*
+
+3 directories, 2 files"
+
+comparetrees "$desttree" "$testtree"
+
+sleep 1
+testsuccess "test DESTDIR in SOURCE second run" \
+    "$CMD" --exclude-from "$excludefile" --oneshot "$tmpdir" "$tmpdest"
+
+filetree=$(tree $tmpdir)
+desttree=$(tree $tmpdest)
+testdate=$(date "+%Y-%m-%d")
+
+testtree="\
+$tmpdir
+├── dir
+│   └── file
+└── file
+
+1 directory, 2 files"
+
+comparetrees "$filetree" "$testtree"
+
+testtree="\
+$tmpdest
+├── ${testdate}_T[0-9_]*
+│   ├── dir
+│   │   └── file
+│   └── file
+├── ${testdate}_T[0-9_]*
+│   ├── dir
+│   │   └── file
+│   └── file
+└── latest -> ${testdate}_T[0-9_]*
+
+5 directories, 4 files"
+
+comparetrees "$desttree" "$testtree"
+
+
+##
+## test max-size
+##
+
+setuptestenv
+echo foo > $tmpdir/file
+testsuccess "test max-size" \
+    "$CMD" --exclude-from "$excludefile" --oneshot --max-size 1 "$tmpdir"/
+
+filetree=$(tree $tmpdir)
+testdate=$(date "+%Y-%m-%d")
+
+testtree="\
+$tmpdir
+├── dir
+│   └── file
+├── file
+└── old-versions
+    ├── ${testdate}_T[0-9_]*
+    │   └── dir
+    │       └── file
+    └── latest -> ${testdate}_T[0-9_]*
+
+5 directories, 3 files"
+
+comparetrees "$filetree" "$testtree"
+
+
+##
+## test combining rapid changes
+##
+
+echo "test combining rapid changes"
+setuptestenv
+"$CMD" --exclude-from "$excludefile" --max-wait 10 --min-interval 30 "$tmpdir" &
+INS_PID=$!
+
+# wait for inotify setting up watches
+sleep 2
+    
+echo foo > $tmpdir/file
+echo bar >> $tmpdir/file
+
+# wait for the backup to finish
+sleep 3
+
+filetree=$(tree $tmpdir)
+testdate=$(date "+%Y-%m-%d")
+
+testtree="\
+$tmpdir
+├── dir
+│   └── file
+├── file
+└── old-versions
+    ├── ${testdate}_T[0-9_]*
+    │   ├── dir
+    │   │   └── file
+    │   └── file
+    └── latest -> ${testdate}_T[0-9_]*
+
+5 directories, 4 files"
+
+comparetrees "$filetree" "$testtree"
+
+diff $tmpdir/file $tmpdir/old-versions/latest/file || error "latest version is not identical to current version"
+
+kill $INS_PID
+
+
+##
+## test min-interval and max-wait
+##
+
+echo "test min-interval and max-wait"
+setuptestenv
+"$CMD" --exclude-from "$excludefile" --max-wait 5 --min-interval 10 "$tmpdir" &
+INS_PID=$!
+
+# wait for inotify setting up watches
+sleep 2
+
+for i in {1..12}; do
+    echo $i > $tmpdir/file$i # $(date "+%Y-%m-%d_T%H_%M_%S")
+    sleep 2
+done
+
+# wait for the remaining backup
+sleep 8
+
+
+filetree=$(tree $tmpdir)
+testdate=$(date "+%Y-%m-%d")
+
+testtree="\
+$tmpdir
+├── dir
+│   └── file
+├── file
+├── file1
+├── file10
+├── file11
+├── file12
+├── file2
+├── file3
+├── file4
+├── file5
+├── file6
+├── file7
+├── file8
+├── file9
+└── old-versions
+    ├── ${testdate}_T[0-9_]*
+    │   ├── dir
+    │   │   └── file
+    │   ├── file
+    │   ├── file1
+    │   └── file2
+    ├── ${testdate}_T[0-9_]*
+    │   ├── dir
+    │   │   └── file
+    │   ├── file
+    │   ├── file1
+    │   ├── file2
+    │   ├── file3
+    │   ├── file4
+    │   ├── file5
+    │   ├── file6
+    │   ├── file7
+    │   ├── file8
+    │   └── file9
+    ├── ${testdate}_T[0-9_]*
+    │   ├── dir
+    │   │   └── file
+    │   ├── file
+    │   ├── file1
+    │   ├── file10
+    │   ├── file11
+    │   ├── file12
+    │   ├── file2
+    │   ├── file3
+    │   ├── file4
+    │   ├── file5
+    │   ├── file6
+    │   ├── file7
+    │   ├── file8
+    │   └── file9
+    └── latest -> ${testdate}_T[0-9_]*
+
+9 directories, 43 files"
+
+comparetrees "$filetree" "$testtree"
+
+cleanexit

@@ -1,0 +1,258 @@
+#!/bin/bash
+#
+# insnapshot - a bash script that watches a directory and automatically creates a snapshot of it when the content changes
+#
+# Copyright (C) 2018  Tim Schoof
+#
+#############################################################################
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#############################################################################
+#
+#   Idea and part of the code taken from https://github.com/gitwatch/gitwatch
+#
+#   Requires the command 'inotifywait' to be available, which is part of
+#   the inotify-tools (See https://github.com/rvoicilas/inotify-tools ),
+#   and rsync.
+#
+
+# Default options
+SOURCE="."  # Trailing slashes DO matter
+EXCLUDEFILE=${HOME}/.rsync/exclude
+LATEST="latest"
+ONESHOT=false
+T_WAIT=2
+T_MAX_WAIT=300
+T_SLEEP=900
+MAX_SIZE=
+
+
+declare -r VERSION=0.1
+declare -r OWNNAME="${0##*/}"
+declare -r SHORTOPTS="h"
+declare -r LONGOPTS="version,help,exclude-from:,oneshot,wait:,max-wait:,delay:,min-interval:,max-size:"
+declare -r INW=$(which inotifywait)
+declare -r RSYNC=$(which rsync)
+declare -r GETOPT=$(which getopt)
+
+
+# Ctrl + C, kill %1 in an interactive session, and kill PID in a script seem to behave all differently
+# The following signal handler tries to ensure that the started subprocesses are stopped in all these cases
+# Make sure to check for orphaned subprocesses whenever the way of starting subprocesses or the signal handling is changed, 
+# e.g., by calling pgrep -af inotifywait and pgrep -af insnapshot after exit
+signal_handler () {
+    [[ -n $INWPID ]] && { kill $INWPID > /dev/null 2>&1 && echo "insnapshot: stopped inotifywait (PID=$INWPID)"; wait $INWPID; }
+    [[ -n $BACKUPPID ]] && { kill $BACKUPPID > /dev/null 2>&1 && echo "insnapshot: stopped main loop (PID=$BACKUPPID)"; wait $BACKUPPID; }
+}
+
+trap signal_handler TERM INT
+
+
+error () {
+    echo ERROR: "$@" >&2
+    exit 1
+}
+
+
+warning () {
+    echo WARNING: "$@" >&2
+}
+
+
+printversion() {
+	echo "$OWNNAME $VERSION by Tim Schoof <tim.schoof@desy.de> and Alexander Schökel <alexander.schoekel@desy.de>"
+	exit 0
+}
+
+
+printhelp() {
+    echo "\
+        Usage: insnapshot [OPTION...] [SRC] [DEST]
+
+        Watches the SRC directory for changes and creates snapshots under the DEST directory. 
+        If SRC is omitted, the current working directory is used. If DEST is omitted, it will be set to $SRC/old-versions.
+
+        Options:
+    " | sed 's/^ *//g'
+    echo "
+        --exclude-from=FILE     | File specifying exclude patterns passed to rsync,
+                                | see there [default: ${EXCLUDEFILE}]
+        --wait=SECONDS          | Wait until there are no changes for the specified
+                                | number of seconds [default: ${T_WAIT}]
+        --max-wait=SECONDS      | When there are ongoing consecutive, rapid changes,
+                                | wait at most this number of seconds [default: ${T_MAX_WAIT}]
+        --min-interval=SECONDS  | Minimum duration between two snapshots in seconds
+                                | [default: ${T_SLEEP}]
+        --max-size=SIZE         | Don't baclup any file larger than SIZE, see rsync
+                                | [default: ${MAX_SIZE:-not set}]
+        --oneshot               | Make a snapshot immediately and exit
+        -h, --help              | Print help and exit
+        --version               | Print version and exit
+    " | sed 's/^ */  /g' | column -s '|' -t
+	exit 0
+}
+
+
+testreq() {
+	[[ -z $INW ]] && error "inotifywait is required"
+	[[ -z $RSYNC ]] && error "rsync is required"
+	[[ -z $GETOPT ]] && error "getopt is required"
+}
+
+
+parse_arguments() {
+    # read parameters from command line
+    inputopts=$("${GETOPT}" -o "${SHORTOPTS}" --longoptions "${LONGOPTS}" --name "${OWNNAME}" -- "${@}") || { echo; printhelp; exit 1; }
+
+    eval set -- "${inputopts}"
+
+    # parse options
+    while [ "$1" != "--" ]; do 
+        case "$1" in
+            --exclude-from) EXCLUDEFILE="$2";shift;;
+            --wait)         T_WAIT="$2";shift;;
+            --max-wait)     T_MAX_WAIT="$2";shift;;
+            --min-interval) T_SLEEP="$2";shift;;
+            --max-size)     MAX_SIZE="$2";shift;;
+            --oneshot)      ONESHOT=true;;
+	        -h|--help)		printhelp;;
+	        --version)	    printversion;;
+	        # TODO: implement setting verbosity level 
+	        *) error "option $1 not implemented.";;
+        esac 
+        shift 
+    done
+    shift
+
+    [[ -n $1 ]] && SOURCE="$1"
+    [[ -n $2 ]] && DESTDIR="$2"
+
+    [[ -n $MAX_SIZE ]] && MAX_SIZE_ARG="--max-size $MAX_SIZE"
+}
+
+
+verify () {
+    [[ "$SOURCE" == "$DESTDIR" ]] && error "SRC and DEST are identical"
+
+    # check that $DESTDIR does not exist or is empty or contains $LATEST
+    if [[ -e "$DESTDIR" ]] && [[ -n $(ls -A "$DESTDIR") ]] && [[ ! -d "$DESTDIR"/"$LATEST" ]]; then
+        warning "$DESTDIR is not empty but does not contain a $LATEST directory"
+    else
+        mkdir -p "$DESTDIR"
+    fi
+
+    # exclude $DESTDIR if $DESTDIR is below $SOURCE
+    EXCLUDEDESTDIR=""
+    if [[ "${DESTDIR##$SOURCE}" != "${DESTDIR}" ]]; then
+        excludepattern="${DESTDIR##$SOURCE}"
+        excludepattern="/${excludepattern#/}"
+        excludepattern="${excludepattern%/}/"
+        EXCLUDEDESTDIR="--exclude $excludepattern"
+    fi
+
+    # check if $EXCLUDEFILE contains .gvfs and append it otherwise
+    if [[ -f "${EXCLUDEFILE}" ]]; then
+        if ! grep -q -e '^- .gvfs/$' "${EXCLUDEFILE}"; then
+            echo "- .gvfs/" >> "${EXCLUDEFILE}"
+        fi
+    else
+        mkdir -p $(dirname "$EXCLUDEFILE")
+        echo "- .gvfs/" >> "${EXCLUDEFILE}"
+    fi
+}
+
+
+# TODO: While includes and excludes can be nicely controled by EXCLUDEFILE,
+# there is not such mechanism for inotifywatch. This will result in backups
+# without any changes. Maybe call diff or rsync --dry-run to check if 
+# included files did actually change
+backup() {
+    verify  # TODO: possible race condition if things change after this
+    date=$(date "+%Y-%m-%d_T%H_%M_%S")
+	"$RSYNC" -aPh \
+	--delete \
+	--delete-excluded \
+	--exclude-from="${EXCLUDEFILE}" $EXCLUDEDESTDIR \
+	--link-dest=../"${LATEST}" $MAX_SIZE_ARG\
+	"${SOURCE}" "${DESTDIR}"/incomplete_$date \
+	&& mv "${DESTDIR}"/incomplete_$date "${DESTDIR}"/$date \
+	&& rm -f "${DESTDIR}"/"${LATEST}" \
+	&& ln -s $date "${DESTDIR}"/"${LATEST}"
+}
+
+
+#########################################################
+
+testreq
+
+parse_arguments "$@"
+
+# check that $SOURCE exists
+if [[ ! -r $SOURCE ]]; then
+    error "$SOURCE does not exist"
+fi
+
+# normalize paths
+SOURCE=$(realpath "$SOURCE")
+SOURCE="${SOURCE%/}/"  # trailing slash means only the content of $SOURCE dir is backed up
+[[ -z "$DESTDIR" ]] && DESTDIR="$SOURCE/old-versions"
+DESTDIR=$(realpath "$DESTDIR")
+
+echo "SOURCE=$SOURCE"
+echo "DESTDIR=$DESTDIR"
+
+# give feedback immediately
+verify
+
+echo "EXCLUDEDESTDIR=$EXCLUDEDESTDIR"
+
+if $ONESHOT; then
+    backup || error "backup failed, something went wrong"
+    exit 0
+fi
+
+
+exec 3> >(while read -r line; do
+    # wait until there is no activity to combine rapid consecutive changes
+    # but not longer than ${T_MAX_WAIT} seconds
+    SECONDS=0
+    while read -r -t ${T_WAIT} dummy; do
+        if (( $SECONDS > ${T_MAX_WAIT} )); then
+            break
+        fi
+    done
+    
+    backup
+    
+    # sleep to limit the number of backups
+    # this process will remain until it is finished when the script is killed
+    sleep ${T_SLEEP}
+done) 
+
+# TODO: There is a small race condition if the process is killed before the following variable is set
+# The time window is very short and should not matter in practice
+BACKUPPID=$!
+
+
+$INW --exclude "^$DESTDIR" -r -m -e modify,move,delete,create "$SOURCE" >&3 &
+
+# TODO: There is a small race condition if the process is killed before the following variable is set
+# The time window is very short and should not matter in practice
+INWPID=$!
+
+# A possible solution for above race conditions can be found in
+# https://unix.stackexchange.com/a/444676
+# See also http://veithen.github.io/2014/11/16/sigterm-propagation.html
+
+wait
+
