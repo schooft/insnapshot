@@ -1,0 +1,11 @@
+language: bash
+
+addons:
+  apt:
+    packages:
+    - inotify-tools
+    - rsync
+    - realpath
+    
+script:
+  - ./runtest
