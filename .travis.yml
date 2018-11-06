@@ -5,7 +5,6 @@ addons:
     packages:
     - inotify-tools
     - rsync
-    - realpath
     
 script:
   - ./runtest
