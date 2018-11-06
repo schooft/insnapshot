@@ -1,5 +1,7 @@
 # insnapshot
 
+[![Build Status](https://travis-ci.com/schooft/insnapshot.svg?branch=master)](https://travis-ci.com/schooft/insnapshot)
+
 A bash script that watches a directory and automatically creates a snapshot of
 it when the content changes
 
