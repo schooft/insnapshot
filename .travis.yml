@@ -5,6 +5,7 @@ addons:
     packages:
     - inotify-tools
     - rsync
+    - tree
     
 script:
   - ./runtest

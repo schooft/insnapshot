@@ -58,6 +58,10 @@ recovery of old versions.
 
 In addition, the file system of the target directory must support hard links.
 
+To run the tests, the following must be installed as well:
+
+* `tree`
+
 
 ## Limitations
 
